@@ -310,9 +310,31 @@ int checkCert(
 	}
 	
 	OCSP_REQUEST* req = OCSP_REQUEST_new();
-	OCSP_CERTID* cert_id = OCSP_cert_to_id(nullptr, (X509*)cert, issuer);
-	OCSP_request_add0_id(req, cert_id);
-	cert_id = OCSP_cert_to_id(nullptr, (X509*)cert, issuer);
+	OCSP_CERTID* requestCertID = OCSP_cert_to_id(nullptr, (X509*)cert, issuer);
+	OCSP_CERTID* responseCertID = OCSP_cert_to_id(nullptr, (X509*)cert, issuer);
+	if (!req || !requestCertID || !responseCertID || !OCSP_request_add0_id(req, requestCertID)) {
+		OCSP_CERTID_free(requestCertID);
+		OCSP_CERTID_free(responseCertID);
+		OCSP_REQUEST_free(req);
+		completionHandler(2, nil, @"Unable to create OCSP request.");
+		return -7;
+	}
+
+	// zsa owns cert and is destroyed when this function returns. Compute this
+	// while cert is still valid; the network callback runs later.
+	NSDate *expirationDate = nil;
+	if (const ASN1_TIME *notAfter = X509_get0_notAfter(cert)) {
+		const unsigned char *notAfterBytes = ASN1_STRING_get0_data((const ASN1_STRING *)notAfter);
+		int notAfterLength = ASN1_STRING_length((const ASN1_STRING *)notAfter);
+		NSString *fullDateString = [[NSString alloc] initWithBytes:notAfterBytes length:notAfterLength encoding:NSASCIIStringEncoding];
+		if (fullDateString) {
+			NSDateFormatter *formatter = [[NSDateFormatter alloc] init];
+			formatter.dateFormat = @"yyMMddHHmmss'Z'";
+			formatter.timeZone = [NSTimeZone timeZoneWithAbbreviation:@"UTC"];
+			formatter.locale = NSLocale.currentLocale;
+			expirationDate = [formatter dateFromString:fullDateString];
+		}
+	}
 	unsigned char* der = 0;
 	int len = i2d_OCSP_REQUEST(req, &der);
 	
@@ -333,41 +355,38 @@ int checkCert(
 	NSURLSession *session = [NSURLSession sharedSession];
 	NSURLSessionDataTask *task = [session dataTaskWithRequest:request
 											completionHandler:^(NSData * _Nullable data,
-																NSURLResponse * _Nullable response,
-																NSError * _Nullable error) {
+															NSURLResponse * _Nullable response,
+															NSError * _Nullable error) {
 		if (error) {
+			OCSP_CERTID_free(responseCertID);
 			completionHandler(2, nil, error.localizedDescription);
 			return;
 		}
 		
 		NSHTTPURLResponse *httpResponse = (NSHTTPURLResponse *)response;
 		if (httpResponse.statusCode == 200 && data) {
-			const void *respBytes = [data bytes];
-			OCSP_RESPONSE *resp;
-			d2i_OCSP_RESPONSE(&resp, (const unsigned char**)&respBytes, data.length);
+			const unsigned char *respBytes = (const unsigned char *)data.bytes;
+			OCSP_RESPONSE *resp = d2i_OCSP_RESPONSE(nullptr, &respBytes, (long)data.length);
+			if (!resp) {
+				OCSP_CERTID_free(responseCertID);
+				completionHandler(2, expirationDate, @"Invalid OCSP response.");
+				return;
+			}
 			OCSP_BASICRESP *basic = OCSP_response_get1_basic(resp);
-			ASN1_TIME *expirationDateAsn1 = X509_get_notAfter(cert);
-			NSString *fullDateString = [NSString stringWithFormat:@"20%s", expirationDateAsn1->data];
-			
-			NSDateFormatter *formatter = [[NSDateFormatter alloc] init];
-			formatter.dateFormat = @"yyyyMMddHHmmss'Z'";
-			formatter.timeZone = [NSTimeZone timeZoneWithAbbreviation:@"UTC"];
-			formatter.locale = NSLocale.currentLocale;
-			NSDate *expirationDate = [formatter dateFromString:fullDateString];
-			
 			int status, reason;
-			if (OCSP_resp_find_status(basic, cert_id, &status, &reason, NULL, NULL, NULL)) {
+			if (basic && OCSP_resp_find_status(basic, responseCertID, &status, &reason, NULL, NULL, NULL)) {
 				completionHandler(status, expirationDate, nil);
 			} else {
 				completionHandler(2, expirationDate, nil);
 			}
 			
-			OCSP_CERTID_free(cert_id);
+			OCSP_CERTID_free(responseCertID);
 			OCSP_BASICRESP_free(basic);
 			OCSP_RESPONSE_free(resp);
 			
 			
 		} else {
+			OCSP_CERTID_free(responseCertID);
 			completionHandler(2, nil, @"Invalid response or no data");
 			return;
 		}
