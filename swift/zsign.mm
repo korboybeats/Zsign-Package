@@ -22,6 +22,8 @@
 #include <openssl/err.h>
 #include <openssl/asn1.h>
 
+#include <memory>
+
 extern "C" {
 
 bool CheckIfSigned(NSString *filePath) {
@@ -174,7 +176,7 @@ int zsign(
 	NSString *bundleversion,
 	bool adhoc,
 	bool excludeprovion,
-	void(^completionHandler)(BOOL success, NSError *error)
+	void(^completionHandler)(BOOL success)
 ) {
 	ZTimer atimer;
 	ZTimer gtimer;
@@ -220,7 +222,7 @@ int zsign(
 	
 	atimer.Reset();
 	ZBundle bundle;
-	bool bRet = bundle.SignFolder(&zsa, strFolder, strBundleId, strBundleVersion, strDisplayName, arrDylibFiles, bForce, bWeakInject, bEnableCache, excludeprovion);
+	bool bRet = bundle.SignFolder(&zsa, strFolder, strBundleId, strBundleVersion, strDisplayName, arrDylibFiles, arrDisDylibFiles, bForce, bWeakInject, bEnableCache, excludeprovion);
 	ZLog::PrintV(">>> Signing:\t%s %s\n", strPath.c_str(), (bAdhoc ? " (Ad-hoc)" : ""));
 	atimer.PrintResult(bRet, ">>> Signed %s!", bRet ? "OK" : "Failed");
 	
@@ -237,8 +239,6 @@ int checkCert(
 	NSString *pass,
 	void(^completionHandler)(int status, NSDate* expirationDate, NSString *error)
 ) {
-	ZTimer gtimer;
-	
 	string strCertFile;
 	string strPKeyFile;
 	string strProvFile;
@@ -254,144 +254,186 @@ int checkCert(
 	strProvFile = [prov cStringUsingEncoding:NSUTF8StringEncoding];
 	strPassword = [pass cStringUsingEncoding:NSUTF8StringEncoding];
 
-	__block ZSignAsset zsa;
+	ZSignAsset zsa;
 		
 	if (!zsa.Init(strCertFile, strPKeyFile, strProvFile, strEntitleFile, strPassword, false, false, false)) {
 		completionHandler(2, nil, @"Unable to initialize certificate. Please check your password.");
 		return -1;
 	}
-		
+
 	X509* cert = (X509*)zsa.m_x509Cert;
-	BIO *brother1;
-	unsigned long issuerHash = X509_issuer_name_hash((X509*)cert);
-	if (0x817d2f7a == issuerHash) {
-		brother1 = BIO_new_mem_buf(ZSignAsset::s_szAppleDevCACert, (int)strlen(ZSignAsset::s_szAppleDevCACert));
-	} else if (0x9b16b75c == issuerHash) {
-		brother1 = BIO_new_mem_buf(ZSignAsset::s_szAppleDevCACertG3, (int)strlen(ZSignAsset::s_szAppleDevCACertG3));
-	} else {
-		completionHandler(2, nil, @"Unable to determine issuer of the certificate. It is signed by Apple Developer?");
+	if (!cert) {
+		completionHandler(2, nil, @"Unable to load certificate.");
 		return -2;
 	}
-		
-	if (!brother1)
-	{
-		completionHandler(2, nil, @"Unable to initialize issuer certificate.");
+
+	using BIOPtr = std::unique_ptr<BIO, decltype(&BIO_free)>;
+	BIOPtr issuerBIO(nullptr, BIO_free);
+	unsigned long issuerHash = X509_issuer_name_hash(cert);
+	if (0x817d2f7a == issuerHash) {
+		issuerBIO.reset(BIO_new_mem_buf(ZSignAsset::s_szAppleDevCACert, (int)strlen(ZSignAsset::s_szAppleDevCACert)));
+	} else if (0x9b16b75c == issuerHash) {
+		issuerBIO.reset(BIO_new_mem_buf(ZSignAsset::s_szAppleDevCACertG3, (int)strlen(ZSignAsset::s_szAppleDevCACertG3)));
+	} else {
+		completionHandler(2, nil, @"Unable to determine issuer of the certificate. It is signed by Apple Developer?");
 		return -3;
 	}
-		
-	X509 *issuer = PEM_read_bio_X509(brother1, NULL, 0, NULL);
-	
-	if (!cert || !issuer) {
-		completionHandler(2, nil, @"Error loading cert or issuer");
+
+	if (!issuerBIO) {
+		completionHandler(2, nil, @"Unable to initialize issuer certificate.");
 		return -4;
 	}
-	
-	// Extract OCSP URL from cert
-	STACK_OF(ACCESS_DESCRIPTION)* aia = (STACK_OF(ACCESS_DESCRIPTION)*)X509_get_ext_d2i((X509*)cert, NID_info_access, 0, 0);
-	if (!aia) {
-		completionHandler(2, nil, @"No AIA (OCSP) extension found in certificate");
+
+	using X509Ptr = std::unique_ptr<X509, decltype(&X509_free)>;
+	X509Ptr issuer(PEM_read_bio_X509(issuerBIO.get(), NULL, 0, NULL), X509_free);
+	if (!issuer) {
+		completionHandler(2, nil, @"Unable to load issuer certificate.");
 		return -5;
 	}
-	
+
+	auto freeAIA = [](STACK_OF(ACCESS_DESCRIPTION)* value) {
+		if (value) sk_ACCESS_DESCRIPTION_pop_free(value, ACCESS_DESCRIPTION_free);
+	};
+	std::unique_ptr<STACK_OF(ACCESS_DESCRIPTION), decltype(freeAIA)> aia(
+		(STACK_OF(ACCESS_DESCRIPTION)*)X509_get_ext_d2i(cert, NID_info_access, 0, 0),
+		freeAIA
+	);
+	if (!aia) {
+		completionHandler(2, nil, @"No AIA (OCSP) extension found in certificate");
+		return -6;
+	}
+
 	ASN1_IA5STRING* uri = nullptr;
-	for (int i = 0; i < sk_ACCESS_DESCRIPTION_num(aia); i++) {
-		ACCESS_DESCRIPTION* ad = sk_ACCESS_DESCRIPTION_value(aia, i);
+	for (int i = 0; i < sk_ACCESS_DESCRIPTION_num(aia.get()); i++) {
+		ACCESS_DESCRIPTION* ad = sk_ACCESS_DESCRIPTION_value(aia.get(), i);
 		if (OBJ_obj2nid(ad->method) == NID_ad_OCSP &&
 			ad->location->type == GEN_URI) {
 			uri = ad->location->d.uniformResourceIdentifier;
-			
 			break;
 		}
 	}
-	
-	if (!uri) {
+
+	if (!uri || ASN1_STRING_length(uri) <= 0) {
 		completionHandler(2, nil, @"No OCSP URI found in certificate.");
-		return -6;
-	}
-	
-	OCSP_REQUEST* req = OCSP_REQUEST_new();
-	OCSP_CERTID* requestCertID = OCSP_cert_to_id(nullptr, (X509*)cert, issuer);
-	OCSP_CERTID* responseCertID = OCSP_cert_to_id(nullptr, (X509*)cert, issuer);
-	if (!req || !requestCertID || !responseCertID || !OCSP_request_add0_id(req, requestCertID)) {
-		OCSP_CERTID_free(requestCertID);
-		OCSP_CERTID_free(responseCertID);
-		OCSP_REQUEST_free(req);
-		completionHandler(2, nil, @"Unable to create OCSP request.");
 		return -7;
 	}
 
-	// zsa owns cert and is destroyed when this function returns. Compute this
-	// while cert is still valid; the network callback runs later.
+	NSString *urlString = [[NSString alloc] initWithBytes:ASN1_STRING_get0_data(uri)
+		length:ASN1_STRING_length(uri)
+		encoding:NSASCIIStringEncoding];
+	NSURL *url = urlString ? [NSURL URLWithString:urlString] : nil;
+	NSString *scheme = url.scheme.lowercaseString;
+	if (!url || (!([scheme isEqualToString:@"http"] || [scheme isEqualToString:@"https"]))) {
+		completionHandler(2, nil, @"Certificate contains an invalid OCSP URL.");
+		return -8;
+	}
+
+	using OCSPRequestPtr = std::unique_ptr<OCSP_REQUEST, decltype(&OCSP_REQUEST_free)>;
+	using OCSPCertIDPtr = std::unique_ptr<OCSP_CERTID, decltype(&OCSP_CERTID_free)>;
+	OCSPRequestPtr req(OCSP_REQUEST_new(), OCSP_REQUEST_free);
+	OCSPCertIDPtr requestCertID(OCSP_cert_to_id(nullptr, cert, issuer.get()), OCSP_CERTID_free);
+	OCSPCertIDPtr responseCertID(OCSP_cert_to_id(nullptr, cert, issuer.get()), OCSP_CERTID_free);
+	if (!req || !requestCertID || !responseCertID) {
+		completionHandler(2, nil, @"Unable to create OCSP request.");
+		return -9;
+	}
+	if (!OCSP_request_add0_id(req.get(), requestCertID.get())) {
+		completionHandler(2, nil, @"Unable to add certificate to OCSP request.");
+		return -10;
+	}
+	requestCertID.release(); // owned by req
+
 	NSDate *expirationDate = nil;
 	if (const ASN1_TIME *notAfter = X509_get0_notAfter(cert)) {
-		const unsigned char *notAfterBytes = ASN1_STRING_get0_data((const ASN1_STRING *)notAfter);
-		int notAfterLength = ASN1_STRING_length((const ASN1_STRING *)notAfter);
-		NSString *fullDateString = [[NSString alloc] initWithBytes:notAfterBytes length:notAfterLength encoding:NSASCIIStringEncoding];
-		if (fullDateString) {
-			NSDateFormatter *formatter = [[NSDateFormatter alloc] init];
-			formatter.dateFormat = @"yyMMddHHmmss'Z'";
-			formatter.timeZone = [NSTimeZone timeZoneWithAbbreviation:@"UTC"];
-			formatter.locale = NSLocale.currentLocale;
-			expirationDate = [formatter dateFromString:fullDateString];
+		struct tm value = {};
+		if (ASN1_TIME_to_tm(notAfter, &value) == 1) {
+			NSDateComponents *components = [[NSDateComponents alloc] init];
+			components.year = value.tm_year + 1900;
+			components.month = value.tm_mon + 1;
+			components.day = value.tm_mday;
+			components.hour = value.tm_hour;
+			components.minute = value.tm_min;
+			components.second = value.tm_sec;
+			NSCalendar *calendar = [[NSCalendar alloc] initWithCalendarIdentifier:NSCalendarIdentifierGregorian];
+			calendar.timeZone = [NSTimeZone timeZoneForSecondsFromGMT:0];
+			expirationDate = [calendar dateFromComponents:components];
 		}
 	}
-	unsigned char* der = 0;
-	int len = i2d_OCSP_REQUEST(req, &der);
-	
-	NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:[NSString stringWithUTF8String:(const char *)uri->data]]];
+
+	unsigned char* encodedRequest = nullptr;
+	int encodedLength = i2d_OCSP_REQUEST(req.get(), &encodedRequest);
+	auto freeOpenSSL = [](unsigned char* value) { OPENSSL_free(value); };
+	std::unique_ptr<unsigned char, decltype(freeOpenSSL)> encodedRequestOwner(encodedRequest, freeOpenSSL);
+	if (encodedLength <= 0 || !encodedRequest) {
+		completionHandler(2, expirationDate, @"Unable to encode OCSP request.");
+		return -11;
+	}
+
+	using X509StorePtr = std::unique_ptr<X509_STORE, decltype(&X509_STORE_free)>;
+	X509StorePtr validationStore(X509_STORE_new(), X509_STORE_free);
+	if (!validationStore || X509_STORE_add_cert(validationStore.get(), issuer.get()) != 1) {
+		completionHandler(2, expirationDate, @"Unable to initialize OCSP validation.");
+		return -12;
+	}
+
+	NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:url];
 	[request setHTTPMethod:@"POST"];
-	[request setHTTPBody:[NSData dataWithBytes:der length:len]];
+	[request setHTTPBody:[NSData dataWithBytes:encodedRequest length:(NSUInteger)encodedLength]];
 	[request setValue:@"application/ocsp-request" forHTTPHeaderField:@"Content-Type"];
 	[request setValue:@"application/ocsp-response" forHTTPHeaderField:@"Accept"];
-	
-	OPENSSL_free(der);
-	if (aia) {
-		sk_ACCESS_DESCRIPTION_pop_free(aia, ACCESS_DESCRIPTION_free);
-	}
-	OCSP_REQUEST_free(req);
-	X509_free(issuer);
-	BIO_free(brother1);
-	
+
+	OCSP_CERTID *asyncCertID = responseCertID.release();
+	X509_STORE *asyncValidationStore = validationStore.release();
+	void (^finish)(int, NSDate *, NSString *) = ^(int status, NSDate *date, NSString *error) {
+		OCSP_CERTID_free(asyncCertID);
+		X509_STORE_free(asyncValidationStore);
+		completionHandler(status, date, error);
+	};
+
 	NSURLSession *session = [NSURLSession sharedSession];
 	NSURLSessionDataTask *task = [session dataTaskWithRequest:request
 											completionHandler:^(NSData * _Nullable data,
-															NSURLResponse * _Nullable response,
-															NSError * _Nullable error) {
+																	NSURLResponse * _Nullable response,
+																	NSError * _Nullable error) {
 		if (error) {
-			OCSP_CERTID_free(responseCertID);
-			completionHandler(2, nil, error.localizedDescription);
+			finish(2, expirationDate, error.localizedDescription);
 			return;
 		}
-		
-		NSHTTPURLResponse *httpResponse = (NSHTTPURLResponse *)response;
-		if (httpResponse.statusCode == 200 && data) {
-			const unsigned char *respBytes = (const unsigned char *)data.bytes;
-			OCSP_RESPONSE *resp = d2i_OCSP_RESPONSE(nullptr, &respBytes, (long)data.length);
-			if (!resp) {
-				OCSP_CERTID_free(responseCertID);
-				completionHandler(2, expirationDate, @"Invalid OCSP response.");
-				return;
-			}
-			OCSP_BASICRESP *basic = OCSP_response_get1_basic(resp);
-			int status, reason;
-			if (basic && OCSP_resp_find_status(basic, responseCertID, &status, &reason, NULL, NULL, NULL)) {
-				completionHandler(status, expirationDate, nil);
-			} else {
-				completionHandler(2, expirationDate, nil);
-			}
-			
-			OCSP_CERTID_free(responseCertID);
-			OCSP_BASICRESP_free(basic);
-			OCSP_RESPONSE_free(resp);
-			
-			
-		} else {
-			OCSP_CERTID_free(responseCertID);
-			completionHandler(2, nil, @"Invalid response or no data");
+
+		if (![response isKindOfClass:NSHTTPURLResponse.class] || ((NSHTTPURLResponse *)response).statusCode != 200 || !data.length) {
+			finish(2, expirationDate, @"Invalid OCSP HTTP response.");
 			return;
 		}
+
+		const unsigned char *responseBytes = (const unsigned char *)data.bytes;
+		using OCSPResponsePtr = std::unique_ptr<OCSP_RESPONSE, decltype(&OCSP_RESPONSE_free)>;
+		OCSPResponsePtr ocspResponse(d2i_OCSP_RESPONSE(nullptr, &responseBytes, (long)data.length), OCSP_RESPONSE_free);
+		if (!ocspResponse || OCSP_response_status(ocspResponse.get()) != OCSP_RESPONSE_STATUS_SUCCESSFUL) {
+			finish(2, expirationDate, @"Invalid OCSP response.");
+			return;
+		}
+
+		using OCSPBasicResponsePtr = std::unique_ptr<OCSP_BASICRESP, decltype(&OCSP_BASICRESP_free)>;
+		OCSPBasicResponsePtr basic(OCSP_response_get1_basic(ocspResponse.get()), OCSP_BASICRESP_free);
+		if (!basic || OCSP_basic_verify(basic.get(), nullptr, asyncValidationStore, 0) != 1) {
+			finish(2, expirationDate, @"Unable to verify OCSP response.");
+			return;
+		}
+
+		int status = V_OCSP_CERTSTATUS_UNKNOWN;
+		int reason = 0;
+		ASN1_GENERALIZEDTIME *revocationTime = nullptr;
+		ASN1_GENERALIZEDTIME *thisUpdate = nullptr;
+		ASN1_GENERALIZEDTIME *nextUpdate = nullptr;
+		if (!OCSP_resp_find_status(basic.get(), asyncCertID, &status, &reason, &revocationTime, &thisUpdate, &nextUpdate) ||
+			!OCSP_check_validity(thisUpdate, nextUpdate, 300, -1)) {
+			finish(2, expirationDate, @"OCSP response is missing or expired.");
+			return;
+		}
+
+		finish(status, expirationDate, nil);
 	}];
-	
+
 	[task resume];
 	return 1;
 }

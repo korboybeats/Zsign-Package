@@ -14,7 +14,7 @@ ZMachO::ZMachO()
 
 ZMachO::~ZMachO()
 {
-	FreeArchOes();
+	Free();
 }
 
 bool ZMachO::Init(const char* szFile)
@@ -31,8 +31,9 @@ bool ZMachO::InitV(const char* szPath, ...)
 
 bool ZMachO::Free()
 {
+	bool bRet = CloseFile();
 	FreeArchOes();
-	return CloseFile();
+	return bRet;
 }
 
 bool ZMachO::NewArchO(uint8_t* pBase, uint32_t uLength)
@@ -52,38 +53,58 @@ void ZMachO::FreeArchOes()
 		ZArchO* archo = m_arrArchOes[i];
 		delete archo;
 	}
-	m_pBase = NULL;
-	m_sSize = 0;
 	m_arrArchOes.clear();
 }
 
 bool ZMachO::OpenFile(const char* szPath)
 {
-	FreeArchOes();
+	if (!Free()) {
+		return false;
+	}
 
 	m_sSize = 0;
 	m_pBase = (uint8_t*)ZFile::MapFile(szPath, 0, 0, &m_sSize, false);
 	if (NULL != m_pBase) {
+		if (m_sSize < sizeof(uint32_t)) {
+			Free();
+			return false;
+		}
 		uint32_t magic = *((uint32_t*)m_pBase);
 		if (FAT_CIGAM == magic || FAT_MAGIC == magic) {
+			if (m_sSize < sizeof(fat_header)) {
+				Free();
+				return false;
+			}
 			fat_header* pFatHeader = (fat_header*)m_pBase;
-			int nFatArch = (FAT_MAGIC == magic) ? pFatHeader->nfat_arch : LE(pFatHeader->nfat_arch);
-			for (int i = 0; i < nFatArch; i++) {
+			uint32_t nFatArch = (FAT_MAGIC == magic) ? pFatHeader->nfat_arch : LE(pFatHeader->nfat_arch);
+			if (nFatArch == 0 || nFatArch > (m_sSize - sizeof(fat_header)) / sizeof(fat_arch)) {
+				Free();
+				return false;
+			}
+			for (uint32_t i = 0; i < nFatArch; i++) {
 				fat_arch* pFatArch = (fat_arch*)(m_pBase + sizeof(fat_header) + sizeof(fat_arch) * i);
-				uint8_t* pArchBase = m_pBase + ((FAT_MAGIC == magic) ? pFatArch->offset : LE(pFatArch->offset));
+				uint32_t uArchOffset = (FAT_MAGIC == magic) ? pFatArch->offset : LE(pFatArch->offset);
 				uint32_t uArchLength = (FAT_MAGIC == magic) ? pFatArch->size : LE(pFatArch->size);
+				if (uArchOffset > m_sSize || uArchLength > m_sSize - uArchOffset) {
+					Free();
+					return false;
+				}
+				uint8_t* pArchBase = m_pBase + uArchOffset;
 				if (!NewArchO(pArchBase, uArchLength)) {
 					ZLog::ErrorV(">>> Invalid arch file in fat mach-o file!\n");
+					Free();
 					return false;
 				}
 			}
 		} else if (MH_MAGIC == magic || MH_CIGAM == magic || MH_MAGIC_64 == magic || MH_CIGAM_64 == magic) {
-			if (!NewArchO(m_pBase, (uint32_t)m_sSize)) {
+			if (m_sSize > UINT32_MAX || !NewArchO(m_pBase, (uint32_t)m_sSize)) {
 				ZLog::ErrorV(">>> Invalid mach-o file!\n");
+				Free();
 				return false;
 			}
 		} else {
 			ZLog::ErrorV(">>> Invalid mach-o file (magic: 0x%08x)!\n", magic);
+			Free();
 			return false;
 		}
 	}
@@ -94,13 +115,15 @@ bool ZMachO::OpenFile(const char* szPath)
 bool ZMachO::CloseFile()
 {
 	if (NULL == m_pBase || m_sSize <= 0) {
-		return false;
+		return true;
 	}
 
 	if (!ZFile::UnmapFile((void*)m_pBase, m_sSize)) {
 		ZLog::ErrorV(">>> CodeSign write(munmap) failed! Error: %p, %lu, %s\n", m_pBase, m_sSize, strerror(errno));
 		return false;
 	}
+	m_pBase = NULL;
+	m_sSize = 0;
 	return true;
 }
 

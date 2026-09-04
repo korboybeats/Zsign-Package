@@ -86,6 +86,11 @@ bool ZBundle::GetSignFolderInfo(const string& strFolder, jvalue& jvNode, bool bG
 bool ZBundle::GetObjectsToSign(const string& strFolder, jvalue& jvInfo)
 {
 	vector<string> allBundles;
+	set<string> bundleExecutables;
+	string rootExecutable = jvInfo["bundle_executable"];
+	if (!rootExecutable.empty()) {
+		bundleExecutables.insert(rootExecutable);
+	}
 	
 	std::function<void(const string&)> findAllBundles = [&](const string& currentPath) {
 		ZFile::EnumFolder(currentPath.c_str(), false, NULL, [&](bool bFolder, const string& strPath) {
@@ -116,6 +121,11 @@ bool ZBundle::GetObjectsToSign(const string& strFolder, jvalue& jvInfo)
 	for (const string& bundlePath : allBundles) {
 		jvalue jvNode;
 		if (GetSignFolderInfo(bundlePath, jvNode)) {
+			string executable = jvNode["bundle_executable"];
+			string path = jvNode["path"];
+			if (!executable.empty() && !path.empty()) {
+				bundleExecutables.insert(path + "/" + executable);
+			}
 			jvInfo["folders"].push_back(jvNode);
 		}
 	}
@@ -134,17 +144,38 @@ bool ZBundle::GetObjectsToSign(const string& strFolder, jvalue& jvInfo)
 			fp = fopen(strPath.c_str(), "rb");
 #endif
 			if (fp) {
+				fseek(fp, 0, SEEK_END);
+				long fileSize = ftell(fp);
+				rewind(fp);
 				uint32_t magic = 0;
 				if (1 == fread(&magic, sizeof(magic), 1, fp)) {
-					bMachO = (magic == MH_MAGIC || magic == MH_CIGAM ||
-							  magic == MH_MAGIC_64 || magic == MH_CIGAM_64 ||
-							  magic == FAT_MAGIC || magic == FAT_CIGAM);
+					bMachO = fileSize >= (long)sizeof(mach_header) &&
+						(magic == MH_MAGIC || magic == MH_CIGAM || magic == MH_MAGIC_64 || magic == MH_CIGAM_64);
+					if (!bMachO && fileSize >= (long)sizeof(fat_header) && (magic == FAT_MAGIC || magic == FAT_CIGAM)) {
+						fat_header header;
+						rewind(fp);
+						if (1 == fread(&header, sizeof(header), 1, fp)) {
+							uint32_t count = (magic == FAT_MAGIC) ? header.nfat_arch : LE(header.nfat_arch);
+							bMachO = count > 0 && count <= ((size_t)fileSize - sizeof(fat_header)) / sizeof(fat_arch);
+							for (uint32_t i = 0; bMachO && i < count; i++) {
+								fat_arch arch;
+								if (1 != fread(&arch, sizeof(arch), 1, fp)) {
+									bMachO = false;
+									break;
+								}
+								uint32_t offset = (magic == FAT_MAGIC) ? arch.offset : LE(arch.offset);
+								uint32_t size = (magic == FAT_MAGIC) ? arch.size : LE(arch.size);
+								bMachO = offset <= (size_t)fileSize && size <= (size_t)fileSize - offset;
+							}
+						}
+					}
 				}
 				fclose(fp);
 			}
 		}
-		if (bMachO) {
-			jvInfo["files"].push_back(strPath.substr(m_strAppFolder.size() + 1));
+		string relativePath = strPath.substr(m_strAppFolder.size() + 1);
+		if (bMachO && !bundleExecutables.count(relativePath)) {
+			jvInfo["files"].push_back(relativePath);
 		}
 		return false;
 	});
